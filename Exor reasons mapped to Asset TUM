@@ -1,0 +1,192 @@
+WITH Truck_State AS (
+    SELECT 
+        "truckId",
+        "shift",
+        "shiftDay"::Timestamp AS "shiftDay",
+        "endTime",
+        "startTime",
+        "reasonCode",
+        "currentState",
+        "equipmentUse",
+        "timeUsageCategory",
+        "locationId",
+        "stateDurationSeconds" as Duration,
+        "runHours",
+        "payload",
+        "batteryVoltage",
+        "odometer",
+        "fuelConsumed",
+        "distanceTravelleddState", 
+        ABS(LEAD("odometer") OVER (
+            PARTITION BY "truckId" 
+            ORDER BY "startTime"
+        ) - "odometer") AS distance_travelled, 
+        ABS(LEAD("fuelConsumed") OVER (
+            PARTITION BY "truckId" 
+            ORDER BY "startTime"
+        ) - "fuelConsumed") AS "fuelBurn", 
+        ABS(LEAD("runHours") OVER (
+            PARTITION BY "truckId" 
+            ORDER BY "startTime"
+        ) - "runHours") AS "eng_hours",  
+        ROW_NUMBER() OVER (
+            PARTITION BY "truckId", "shiftDay", "shift"
+            ORDER BY "startTime" DESC
+        ) AS RowNum
+    FROM 
+        dw.truckstatehistory t
+    WHERE 
+        "shiftDay" > '2024-12-01'  	
+),
+Beacon_ID AS (
+    SELECT 
+        e.operational_location,
+        e.equipment_id AS equipment_id,
+        e.effective_from_time,
+        e.effective_to_time
+    FROM 
+        datamart.equipment e
+    WHERE 
+        e.effective_from_time <= now() AND e.effective_to_time > now()
+),
+op_data as (
+SELECT 
+    ts."truckId",
+    ts."shift",
+    ts."shiftDay",
+    ts."startTime",
+    ts."endTime",
+    ts."currentState",
+    ts."equipmentUse",
+    ts."reasonCode",
+    ts."timeUsageCategory",
+    ts."payload",
+    ts."locationId",
+    ts."runHours",
+    ts."batteryVoltage",
+    ts."odometer",
+    ts."fuelConsumed",
+    ts."fuelBurn",
+    ts."eng_hours",
+    ts.Duration,
+    ts."distance_travelled",
+    ts."distanceTravelleddState",
+    pe.operational_location,
+     CASE ts."reasonCode"
+        WHEN 'Hauling' THEN 'Productive Time'
+        WHEN 'Dumping' THEN 'Productive Time'
+        WHEN 'SpotAtDump' THEN 'Productive Time'
+        WHEN 'SpotAtLoader' THEN 'Productive Time' 
+        WHEN 'Loading' THEN 'Productive Time'         
+        WHEN 'TravelToLoader' THEN 'Non Productive Time'
+        WHEN 'QueueAtLoader' THEN 'Non Productive Time'
+        WHEN 'QueueAtDump' THEN 'Non Productive Time'
+        WHEN 'TravelToFuelStation' THEN 'Operating Delay'
+        WHEN 'QueueAtFuelBay' THEN 'Operating Delay'
+        WHEN 'Refueling' THEN 'Operating Delay'
+        WHEN 'BlockedDecline' THEN 'Operating Delay'
+        WHEN 'AwaitingReEntry' THEN 'Operating Delay'
+        WHEN 'AwaitingLoader' THEN 'Operating Delay'
+        WHEN 'TravelToTowPoint' THEN 'Operating Delay'
+        WHEN 'AwaitTowingEquipment' THEN 'Operating Delay'
+        WHEN 'PartLoadTowTruck' THEN 'Operating Delay'
+        WHEN 'FitTowingHardware' THEN 'Operating Delay'
+        WHEN 'Towing' THEN 'Operating Delay'
+        WHEN 'TravelToCrib' THEN 'Standby'
+        WHEN 'AwaitingOperatorOnCrib' THEN 'Standby'
+        WHEN 'TravelToHandoverLocation' THEN 'Standby'
+        WHEN 'EndOfShiftInspection' THEN 'Standby'
+        WHEN 'PreStartInspection' THEN 'Standby'
+        WHEN 'TravelToWashbay' THEN 'Standby'
+        WHEN 'EquipmentWashdown' THEN 'Standby'
+        WHEN 'ParkedAtGoLine' THEN 'Standby'
+        WHEN 'Stopped' THEN 'Standby'
+        WHEN 'Incident' THEN 'Standby'
+        WHEN 'CribTimeAllowanceExceeded' THEN 'Standby'
+        WHEN 'NoOperator:PersonalBreak' THEN 'Standby'
+        WHEN 'TravelToMaintenance' THEN 'Scheduled DownTime'
+        WHEN 'TravelToParkup' THEN 'Scheduled DownTime'
+        WHEN 'ParkedAtNoGoLine' THEN 'Scheduled DownTime'
+        WHEN 'BreakDown:DamageRepairs' THEN 'UnScheduled DownTime'
+        WHEN 'BreakDown:EngineSystem' THEN 'BreakDown'
+        WHEN 'BreakDown:HydraulicSystem' THEN 'BreakDown'
+        WHEN 'BreakDown:Cab/ChassisSystem' THEN 'BreakDown'
+        WHEN 'BreakDown:DriveTrain' THEN 'BreakDown'
+        WHEN 'BreakDown:Tyres/Rims' THEN 'BreakDown'
+        WHEN 'BreakDown:ElectricalSystem' THEN 'BreakDown'
+        ELSE 'Unknown'
+    END AS GSM_TUM,
+    CASE ts."reasonCode"
+        WHEN 'TravelToMaintenance' THEN 'DownTime'
+        WHEN 'TravelToParkup' THEN 'DownTime'
+        WHEN 'ParkedAtNoGoLine' THEN 'DownTime'
+        WHEN 'BreakDown:DamageRepairs' THEN 'DownTime'
+        WHEN 'BreakDown:EngineSystem' THEN 'DownTime'
+        WHEN 'BreakDown:HydraulicSystem' THEN 'DownTime'
+        WHEN 'BreakDown:Cab/ChassisSystem' THEN 'DownTime'
+        WHEN 'BreakDown:DriveTrain' THEN 'DownTime'
+        WHEN 'BreakDown:Tyres/Rims' THEN 'DownTime'
+        WHEN 'BreakDown:ElectricalSystem' THEN 'DownTime'
+        ELSE NULL
+    END AS GSM_TUM_DownTime_agg,
+    case ts."reasonCode"
+    	WHEN 'BreakDown:EngineSystem' THEN 1
+        WHEN 'BreakDown:HydraulicSystem' THEN 1
+        WHEN 'BreakDown:Cab/ChassisSystem' THEN 1
+        WHEN 'BreakDown:DriveTrain' THEN 1
+        WHEN 'BreakDown:Tyres/Rims' THEN 1
+        WHEN 'BreakDown:ElectricalSystem' THEN 1
+    	else 0
+    end as BreakDown_eventCount   
+FROM 
+    Truck_State ts
+LEFT JOIN 
+    Beacon_ID pe ON ts."locationId" = pe.equipment_id
+)
+select 
+	"truckId",
+    "shift",
+    "shiftDay",
+    "startTime",
+    "endTime",
+    "currentState",
+    "equipmentUse",
+    "reasonCode",
+    "timeUsageCategory",
+    "payload",
+    "locationId",
+    "runHours",
+    "batteryVoltage",
+    "odometer",
+    "fuelConsumed",
+    "fuelBurn",
+    "eng_hours",
+     Duration,
+    "distance_travelled",
+    "distanceTravelleddState",
+    operational_location,
+    BreakDown_eventCount,
+    GSM_TUM,
+	GSM_TUM_DownTime_agg,
+	    SUM(Duration) OVER (
+        PARTITION BY "truckId"
+        ORDER BY "startTime"
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) / 3600.0 AS cumulative_total_hours,
+    SUM(CASE WHEN GSM_TUM_DownTime_agg = 'DownTime' THEN Duration ELSE 0 END) OVER (
+        PARTITION BY "truckId"
+        ORDER BY "startTime"
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) / 3600.0 AS cumulative_downtime_hours,
+    SUM(CASE WHEN BreakDown_eventCount = 1 THEN Duration ELSE 0 END) OVER (
+        PARTITION BY "truckId"
+        ORDER BY "startTime"
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) / 3600.0 AS cumulative_breakdown_hours,
+    	SUM(BreakDown_eventCount) OVER (
+        PARTITION BY "truckId"
+        ORDER BY "startTime"
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cumulative_BreakDown_eventCount
+from
+	op_data
