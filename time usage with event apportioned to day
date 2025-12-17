@@ -1,0 +1,170 @@
+WITH calendar AS (
+    SELECT
+        period_start,
+        period_end,
+        date::date AS date,
+        year,
+        month,
+        day
+    FROM datamart.cal_days
+    WHERE year = EXTRACT(YEAR FROM CURRENT_DATE)
+),
+ec AS (
+  SELECT
+    ec.equipment_capability_sk,
+    ec.start_time,
+    ec.end_time,
+    ec.entity_type,
+    ec.entity_sk,
+    ec.entity_id,
+    ec.version,
+    ec.description,
+    ec.hierarchy_scope,
+    ec.equipment_ids[1]       AS equipment_id,
+    ec.equipment_class_ids[1] AS equipment_class_id,
+    ec.equipment_use,
+    ec.capability_type,
+    ec.reason,
+    ec.record_time,
+    ec.source_system,
+    ec.ingestion_reference_sk
+  FROM dw.equipment_capability ec
+),
+props AS (
+  SELECT
+    p.entity_sk,
+    p.id,
+    p.value,
+    p.unit_of_measure,
+    p.data_type,
+    p.property_sk,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.entity_sk, p.id
+      ORDER BY p.property_sk DESC
+    ) AS rn
+  FROM dw.property p
+  WHERE p.id ilike 'Time Usage Category'
+),
+ec_property AS (
+  SELECT
+    ec.equipment_capability_sk,
+    ec.start_time,
+    ec.end_time,
+    ec.hierarchy_scope,
+    ec.equipment_id,
+    ec.equipment_class_id,
+    ec.equipment_use,
+    ec.capability_type,
+    ec.reason,
+    ec.record_time,
+    ec.source_system,
+    tuc.value  AS "Time Usage Category"
+  FROM ec
+  LEFT JOIN props tuc 
+  ON tuc.entity_sk = ec.equipment_capability_sk AND tuc.id = 'Time Usage Category' AND tuc.rn = 1
+),
+op_data AS (
+  SELECT
+    ep.equipment_id AS "equipId",
+    ep.equipment_class_id,
+    NULL::text AS "shift",
+    ep.start_time AS "startTime",
+    ep.end_time   AS "endTime",
+    ep.equipment_use AS "equipmentUse",
+    ep.reason AS "reasonCode",
+    ep."Time Usage Category" AS "timeUsageCategory_raw",
+    ep.record_time,
+    GREATEST(
+      0,
+      EXTRACT(EPOCH FROM (COALESCE(ep.end_time, ep.start_time) - ep.start_time))
+    )::bigint AS "Duration",
+    NULL::numeric AS "distance_travelled",
+    NULL::numeric AS "distanceTravelledState"
+  FROM ec_property ep
+),
+final AS (
+  SELECT
+    "equipId",
+    equipment_class_id,
+    "shift",
+    "startTime",
+    "endTime",
+    "equipmentUse",
+    "reasonCode",
+    "record_time",
+    "timeUsageCategory_raw",
+    regexp_replace("timeUsageCategory_raw", '.*\|', '') AS "timeUsageCategory",
+    "Duration",
+    CASE
+      WHEN regexp_replace("timeUsageCategory_raw", '.*\|', '') ILIKE 'breakdown'
+        THEN 1
+      ELSE 0
+    END AS BreakDown_eventCount
+  FROM op_data
+),
+-- DEDUPE HERE (keep latest record_time for identical event keys)
+final_dedup AS (
+  SELECT DISTINCT ON (
+      "equipId",
+      "startTime",
+      COALESCE("endTime","startTime"),
+      "timeUsageCategory_raw",
+      COALESCE("reasonCode",''),
+      COALESCE("equipmentUse",'')
+    ) *
+  FROM final
+  ORDER BY
+      "equipId",
+      "startTime",
+      COALESCE("endTime","startTime"),
+      "timeUsageCategory_raw",
+      COALESCE("reasonCode",''),
+      COALESCE("equipmentUse",''),
+      record_time DESC
+),
+-- Apportion split events across shift-hours (calendar rows)
+apportioned AS (
+  SELECT
+    c.*,
+    s."equipId",
+    s.equipment_class_id AS equipment_class,
+    s."shift",
+    s."equipmentUse",
+    s."reasonCode",
+    s."timeUsageCategory_raw",
+    s."timeUsageCategory",
+    s.BreakDown_eventCount,
+    GREATEST(s."startTime", c.period_start) AS split_start,
+    LEAST(COALESCE(s."endTime", s."startTime"), c.period_end) AS split_end,
+    EXTRACT(
+      EPOCH FROM (
+        LEAST(COALESCE(s."endTime", s."startTime"), c.period_end)
+        - GREATEST(s."startTime", c.period_start)
+      )
+    )::bigint AS apportioned_duration_sec
+  FROM calendar c
+  left JOIN final_dedup s
+    ON s."startTime" < c.period_end
+   AND COALESCE(s."endTime", s."startTime") > c.period_start
+)
+SELECT
+  a.*,
+  SUM(apportioned_duration_sec) OVER (
+    PARTITION BY "equipId", date
+    ORDER BY split_start, split_end
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) / 3600.0 AS cumulative_total_hours,
+  SUM(
+    CASE WHEN BreakDown_eventCount = 1
+         THEN apportioned_duration_sec ELSE 0 END
+  ) OVER (
+    PARTITION BY "equipId", date
+    ORDER BY split_start, split_end
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) / 3600.0 AS cumulative_breakdown_hours,
+  SUM(BreakDown_eventCount) OVER (
+    PARTITION BY "equipId", date
+    ORDER BY split_start, split_end
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS cumulative_BreakDown_eventCount
+FROM apportioned a
