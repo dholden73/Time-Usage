@@ -1,0 +1,51 @@
+WITH raw_capabilities AS (
+  select
+    m.event_time,
+    wc.work_capability_id,
+    wc.operations_type,
+    ec.equipment_capability_sk,
+    ec.equipment_capability_id,
+    ec.equipment_class_ids[1] AS equipment_class_id,
+    ec.equipment_ids[1]      AS equipment_id,
+    ec.equipment_use,
+    ec.capability_type,
+    ec.reason,
+    ec.start_time,
+    ec.end_time,
+    ec.record_time
+  FROM dw.work_capability wc
+  LEFT JOIN dw.equipment_capability ec
+    ON ec.entity_sk = wc.work_capability_sk
+  LEFT join aud.message m on m.message_sk=ec.ingestion_reference_sk
+),
+clean_capabilities AS (
+  SELECT j.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY equipment_id, start_time
+           ORDER BY record_time DESC, work_capability_id DESC
+         ) AS rn
+  FROM raw_capabilities j
+)
+SELECT 
+  c.event_time,
+    c.work_capability_id,
+    c.operations_type,
+    c.equipment_capability_id,
+    c.equipment_class_id,
+    c.equipment_id,
+    c.equipment_use,
+    c.capability_type,
+    c.reason,
+    c.start_time,
+    c.end_time,
+    p.id as property, 
+    p.key as property_key, 
+    case
+      when p.id IN ('Time Usage Category')
+        then regexp_replace(p.value::text, '.*\|','')
+      else p.value
+    end as property_value,  
+    p.unit_of_measure as property_uom,
+    p.data_type as property_data_type
+FROM clean_capabilities c left join dw.property p on p.entity_sk=c.equipment_capability_sk
+WHERE rn = 1
