@@ -1,0 +1,55 @@
+WITH cal AS (
+  SELECT
+    period_start,
+    period_end,
+    shift_name,
+    date::date AS shift_date
+  FROM datamart.cal_shifts
+  WHERE year = EXTRACT(YEAR FROM CURRENT_DATE)
+),
+tum_raw as ( 
+	select 
+		(t.start_time AT TIME ZONE 'UTC') AS start_time_utc, 
+		(t.end_time AT TIME ZONE 'UTC') AS end_time_utc, 
+		t.equipment_id,
+	    t.equipment_type_id,
+	    t.equipment_fleet_id,
+	    t.equipment_state,
+	    t.reason_code,
+	    t.tum_category_path,
+	    t.duration_in_s 
+	from tum.source_event t
+)
+	SELECT
+	    c.period_start,
+	    c.period_end,
+	    c.shift_name,
+	    c.shift_date,
+	    s.equipment_id,
+	    s.equipment_type_id,
+	    s.equipment_fleet_id,
+	    s.equipment_state,
+	    s.reason_code,
+	    s.tum_category_path,
+	    s.duration_in_s,
+	    s.start_time_utc,
+	    s.end_time_utc,
+	    CASE
+	      WHEN s.tum_category_path IS NOT NULL
+	      THEN regexp_replace(s.tum_category_path::text, '.*\|', '')
+	      ELSE NULL
+	    END AS timeusagecategory,
+	    (s.duration_in_s::numeric)/3600.0 AS duration_hrs,
+	    GREATEST(s.start_time_utc, c.period_start) AS split_start,
+	    LEAST(COALESCE(s.end_time_utc, s.start_time_utc), c.period_end) AS split_end,
+	    GREATEST(
+	      0,
+	      EXTRACT(EPOCH FROM (
+	        LEAST(COALESCE(s.end_time_utc, s.start_time_utc), c.period_end)
+	        - GREATEST(s.start_time_utc, c.period_start)
+	      ))
+	    )/3600 AS apportioned_duration_hr
+	FROM cal c
+	LEFT JOIN tum_raw s
+   		ON s.start_time_utc < c.period_end
+    	AND COALESCE(s.end_time_utc, s.start_time_utc) > c.period_start
