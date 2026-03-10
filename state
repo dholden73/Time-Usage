@@ -1,0 +1,13 @@
+select ec.equipment_ids[1] as truckId, ec.start_time as eventTime,     
+	case
+    	when p.id = ('Time Usage Category')
+        then regexp_replace(p.value::text, '.*\|','')
+      	else p.value
+    end stateName
+from dw.equipment_capability ec left join dw.property p on p.entity_sk = ec.equipment_capability_sk and p.id='Time Usage Category'
+where ec.equipment_ids[1] like 'TR%' AND ec.equipment_ids[1] NOT iLIKE '%CORRUPTED'
+union
+select distinct t.equipment_ids[1] as truckid , now() as eventTime, 'DDD' as stateName
+from dw.equipment_capability t 
+where t.equipment_ids[1] like 'TR%' AND t.equipment_ids[1] NOT iLIKE '%CORRUPTED'
+order by eventtime desc
