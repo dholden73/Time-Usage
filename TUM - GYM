@@ -1,0 +1,71 @@
+WITH cal AS (
+    SELECT
+        period_start,
+        period_end,
+        shift_name,
+        date::timestamp as shift_date
+    FROM datamart.cal_shifts
+    WHERE year = extract(year from CURRENT_DATE)
+),
+tum_raw as (
+	select
+		(t.start_time AT TIME ZONE 'UTC') AS start_time_utc,
+		(t.end_time AT TIME ZONE 'UTC') AS end_time_utc,
+		t.*
+	from tum.source_event t
+)
+    SELECT
+        period_start,
+        period_end,
+        c.shift_name,
+        shift_date,
+        tum.start_time_utc,
+		tum.end_time_utc,
+		tum.work_capability_id,
+		tum.equipment_capability_sk,
+		tum.equipment_id,
+		tum.work_capability_sk,
+		tum.equipment_type_id,
+		tum.equipment_fleet_id,
+		tum.duration_in_s, 
+		tum.reason_code,
+		tum.equipment_state,
+		tum.flexin_category,
+		tum.flexin_sub_category,
+		tum.maca_category,
+		tum.tum_category_path,
+		tum.props,
+		tum.received_time,
+		tum.version_record_time,
+		tum.refreshed_at,
+		tum.tum_ct,
+		tum.tum_st,
+		tum.tum_ut,
+		tum.tum_at,
+		tum.tum_dt,
+		tum.tum_ot,
+		tum.tum_sb,
+		tum.tum_sdt,
+		tum.tum_udt,
+		tum.tum_bd,
+		tum.tum_wt,
+		tum.tum_od,
+		tum.tum_os,
+		tum.tum_es,
+		tum.tum_pt,
+		tum.tum_npt,
+		tum.tum_mask,
+        CASE
+            WHEN tum.tum_category_path IS NOT NULL
+            THEN regexp_replace(tum.tum_category_path::text, '.*\|', '')
+            ELSE NULL
+        END AS timeusagecategory,
+        (duration_in_s::numeric)/3600 AS duration_hrs
+    FROM tum_raw tum 
+    left join cal c
+ 	ON tum.start_time_utc >= c.period_start
+ 	AND tum.start_time_utc <  c.period_end
+ 	where equipment_id = 'DT307'
+ 	order by start_time_utc desc
+ 	
+ 
