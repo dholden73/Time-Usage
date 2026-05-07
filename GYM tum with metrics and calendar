@@ -1,0 +1,52 @@
+WITH cal AS (
+  SELECT
+    (period_start AT TIME ZONE 'UTC') AS period_start_utc,  -- timestamptz
+    (period_end   AT TIME ZONE 'UTC') AS period_end_utc,    -- timestamptz
+    shift_name,
+    CASE
+      WHEN shift_name = 'Day Shift'   THEN 'DS'
+      WHEN shift_name = 'Night Shift' THEN 'NS'
+      ELSE NULL
+    END AS shift_short,
+    date::date AS shift_date
+  FROM datamart.cal_shifts
+  WHERE year = EXTRACT(YEAR FROM CURRENT_DATE)
+),
+tum_raw AS (
+  SELECT
+    CASE
+      WHEN t.tum_category_path IS NOT NULL
+      THEN regexp_replace(t.tum_category_path::text, '.*\|', '')
+      ELSE NULL
+    END AS timeusagecategory,
+    t.*
+  FROM tum.source_event t
+)
+SELECT
+  c.period_start_utc AS period_start,
+  c.period_end_utc   AS period_end,
+  c.shift_date,
+  c.shift_short      AS shift_name,
+  to_char(c.shift_date, 'DD Mon') || ' - ' || c.shift_short AS shift_label,
+  tum.*,
+  -- ✅ apportioned duration: only the part of the event that overlaps the shift window
+  GREATEST(
+    0,
+    EXTRACT(EPOCH FROM (
+      LEAST(COALESCE(tum.end_time, 'infinity'::timestamptz), c.period_end_utc)
+      - GREATEST(tum.start_time, c.period_start_utc)
+    ))
+  ) / 3600.0 AS duration_hrs,
+  CASE tum.timeusagecategory
+    WHEN 'Productive Time'        THEN 'Utilisation'
+    WHEN 'Non-Productive Time'    THEN 'Utilisation'
+    WHEN 'Unscheduled Downtime'   THEN 'Availability'
+    WHEN 'Operating Delay'        THEN 'Eficiency'
+    WHEN 'Operational Standby'    THEN 'U of A'
+    WHEN 'External Standby'       THEN 'U of A'
+    ELSE NULL
+  END AS time_usage_metric_group
+FROM tum_raw tum
+JOIN cal c
+  ON tum.start_time < c.period_end_utc
+ AND COALESCE(tum.end_time, 'infinity'::timestamptz) > c.period_start_utc
