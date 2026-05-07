@@ -1,0 +1,115 @@
+WITH cur_shift AS (
+  SELECT s.*
+  FROM datamart.cal_shifts s
+  WHERE now() >= (s.period_start AT TIME ZONE 'UTC')
+    AND now() <  (s.period_end   AT TIME ZONE 'UTC')
+  ORDER BY s.period_start DESC
+  LIMIT 1
+),
+prev_shift AS (
+  SELECT s.*
+  FROM datamart.cal_shifts s
+  JOIN cur_shift c ON s.period_end = c.period_start
+  LIMIT 1
+),
+prev_prev_shift AS (
+  SELECT s.*
+  FROM datamart.cal_shifts s
+  JOIN prev_shift c ON s.period_end = c.period_start
+  LIMIT 1
+),
+win AS (
+  SELECT
+    COALESCE(p.period_start, c.period_start) AS win_start,
+    c.period_end                             AS win_end
+  FROM cur_shift c
+  LEFT JOIN prev_prev_shift p ON true
+),
+win_tz AS (
+  SELECT
+    (win_start AT TIME ZONE 'UTC')::timestamptz AS win_start_utc,
+    (win_end   AT TIME ZONE 'UTC')::timestamptz AS win_end_utc
+  FROM win
+),
+roster AS (
+  SELECT
+    e.equipment_id,
+    MAX(p.value) FILTER (WHERE p.property_id = 'Operational Group') AS operational_group,
+    MAX(p.value) FILTER (WHERE p.property_id = 'Scheduling Group')  AS scheduling_group
+  FROM datamart.equipment e
+  LEFT JOIN datamart.property p
+    ON p.root_datamart_sk = e.datamart_sk
+   AND p.property_id IN ('Operational Group', 'Scheduling Group')
+  CROSS JOIN win w
+  WHERE e.equipment_class_id = 'Haul Truck'
+    AND w.win_start >= e.effective_from_time
+    AND w.win_start <  e.effective_to_time
+  GROUP BY e.equipment_id
+),
+events AS (
+  SELECT
+    se.equipment_id,
+    GREATEST(se.start_time, w.win_start_utc) AS ts_start,
+    LEAST(COALESCE(se.end_time, now()), w.win_end_utc) AS ts_end,
+    COALESCE(se.reason_code, 'Unknown') AS state,
+    CASE
+      WHEN tum.tum_path_has(se.tum_mask, 'pt')  THEN 'PT'
+      WHEN tum.tum_path_has(se.tum_mask, 'npt') THEN 'NPT'
+      WHEN tum.tum_path_has(se.tum_mask, 'od')  THEN 'OD'
+      WHEN tum.tum_path_has(se.tum_mask, 'os')  THEN 'OS'
+      WHEN tum.tum_path_has(se.tum_mask, 'es')  THEN 'ES'
+      WHEN tum.tum_path_has(se.tum_mask, 'udt') THEN 'UDT'
+      WHEN tum.tum_path_has(se.tum_mask, 'sdt') THEN 'SDT'
+      WHEN tum.tum_path_has(se.tum_mask, 'bd')  THEN 'BD'
+      WHEN tum.tum_path_has(se.tum_mask, 'ut')  THEN 'UP'
+      ELSE '--'
+    END AS tum_bucket
+  FROM roster r
+  JOIN tum.source_event se
+    ON se.equipment_id = r.equipment_id
+  CROSS JOIN win_tz w
+  WHERE se.event_range && tstzrange(w.win_start_utc, w.win_end_utc, '[)')
+),
+has_events AS (
+  SELECT DISTINCT equipment_id
+  FROM events
+),
+real_rows AS (
+  SELECT
+    r.equipment_id AS metric,
+    e.ts_start     AS "time",
+    e.ts_end       AS time_end,
+    e.state,
+    e.tum_bucket
+  FROM roster r
+  JOIN events e
+    ON e.equipment_id = r.equipment_id
+),
+nodata_rows AS (
+  SELECT
+    r.equipment_id  AS metric,
+    w.win_start_utc AS "time",
+    w.win_end_utc   AS time_end,
+    'No data'       AS state,
+    ''              AS tum_bucket
+  FROM roster r
+  CROSS JOIN win_tz w
+  LEFT JOIN has_events h
+    ON h.equipment_id = r.equipment_id
+  WHERE h.equipment_id IS NULL
+)
+SELECT
+  "time",
+  time_end,
+  state || '|' || tum_bucket AS state,
+  metric
+FROM real_rows
+UNION ALL
+SELECT
+  "time",
+  time_end,
+  state || '|' || tum_bucket AS state,
+  metric
+FROM nodata_rows
+where metric ='DT330'
+ORDER BY metric, "time" desc;
