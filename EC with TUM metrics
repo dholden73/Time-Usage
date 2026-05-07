@@ -1,0 +1,136 @@
+WITH ec AS (
+  SELECT
+      equipment_capability_sk,
+      equipment_capability_id,
+      equipment_class_ids[1] AS equipment_class_id,
+      equipment_ids[1]       AS equipment_id,
+      equipment_use,
+      capability_type,
+      reason,
+      start_time,
+      end_time,
+      record_time,
+      entity_sk,
+      ingestion_reference_sk
+  FROM dw.equipment_capability
+  WHERE equipment_class_ids[1] = 'Production Drill'
+),
+raw_capabilities AS (
+  SELECT
+      m.event_time,
+      wc.work_capability_id,
+      wc.operations_type,
+      ec.equipment_capability_sk,
+      ec.equipment_capability_id,
+      ec.equipment_class_id,
+      ec.equipment_id,
+      ec.equipment_use,
+      ec.capability_type,
+      ec.ingestion_reference_sk,
+      ec.reason,
+      ec.start_time,
+      ec.end_time,
+      ec.record_time
+  FROM ec
+  LEFT JOIN dw.work_capability wc ON wc.work_capability_sk = ec.entity_sk
+  LEFT JOIN aud.message        m  ON m.message_sk          = ec.ingestion_reference_sk
+),
+clean_capabilities AS (
+  SELECT j.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY equipment_id, start_time
+           ORDER BY record_time DESC, work_capability_id DESC
+         ) AS rn
+  FROM raw_capabilities j
+),
+-- Anchor: EC-1 is used for the descriptive attributes + Corrective Maintenance Total
+ec1 AS (
+  SELECT DISTINCT ON (c.work_capability_id) 
+      c.event_time,
+      c.work_capability_id,
+      c.operations_type,
+      c.equipment_class_id,
+      c.equipment_id,
+      c.start_time,
+      c.end_time,
+      c.ingestion_reference_sk,
+      c.equipment_capability_sk,
+      op.value AS operator,
+      sd.value AS shift_date,
+      st.value AS shift_type,
+      sb.value AS corrective_maintenance
+  FROM clean_capabilities c
+  LEFT JOIN LATERAL (
+      SELECT value FROM dw.property
+      WHERE entity_sk = c.equipment_capability_sk AND id = 'Operator'
+      LIMIT 1
+  ) op ON TRUE
+  LEFT JOIN LATERAL (
+      SELECT value FROM dw.property
+      WHERE entity_sk = c.equipment_capability_sk AND id = 'Shift Date'
+      LIMIT 1
+  ) sd ON TRUE
+  LEFT JOIN LATERAL (
+      SELECT value FROM dw.property
+      WHERE entity_sk = c.equipment_capability_sk AND id = 'Shift Type'
+      LIMIT 1
+  ) st ON TRUE
+  LEFT JOIN LATERAL (
+      SELECT value FROM dw.property
+      WHERE entity_sk = c.equipment_capability_sk AND id = 'Corrective Maintenance Total Hours'
+      LIMIT 1
+  ) sb ON TRUE
+  WHERE c.equipment_capability_id = 'EC-1'
+  ORDER BY c.work_capability_id, c.record_time DESC
+)
+SELECT
+    a.event_time,
+    a.work_capability_id,
+    a.operations_type,
+    a.equipment_class_id,
+    a.equipment_id,
+    a.start_time,
+    a.end_time,
+    a.ingestion_reference_sk,
+    a.operator,
+    a.shift_date,
+    a.shift_type,
+    a.corrective_maintenance::numeric,
+    e2.operating_standby::numeric,
+    e3.scheduled_maintenance::numeric,
+    e4.productive_time_total::numeric
+FROM ec1 a
+LEFT JOIN LATERAL (
+    SELECT p.value AS operating_standby
+    FROM clean_capabilities c
+    LEFT JOIN dw.property p
+      ON p.entity_sk = c.equipment_capability_sk
+     AND p.id = 'Operating Standby Total'
+    WHERE c.equipment_capability_id = 'EC-2'
+      AND c.work_capability_id = a.work_capability_id
+    ORDER BY c.record_time DESC
+    LIMIT 1
+) e2 ON TRUE
+LEFT JOIN LATERAL (
+    SELECT p.value AS scheduled_maintenance
+    FROM clean_capabilities c
+    LEFT JOIN dw.property p
+      ON p.entity_sk = c.equipment_capability_sk
+     AND p.id = 'Scheduled Maintenance Total'
+    WHERE c.equipment_capability_id = 'EC-3'
+      AND c.work_capability_id = a.work_capability_id
+    ORDER BY c.record_time DESC
+    LIMIT 1
+) e3 ON TRUE
+LEFT JOIN LATERAL (
+    SELECT p.value AS productive_time_total
+    FROM clean_capabilities c
+    LEFT JOIN dw.property p
+      ON p.entity_sk = c.equipment_capability_sk
+     AND p.id = 'Productive Time Total'
+    WHERE c.equipment_capability_id = 'EC-4'
+      AND c.work_capability_id = a.work_capability_id
+    ORDER BY c.record_time DESC
+    LIMIT 1
+) e4 ON TRUE
+ORDER BY a.start_time DESC, a.equipment_id, a.shift_date, a.shift_type;
